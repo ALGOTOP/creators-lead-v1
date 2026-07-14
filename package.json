@@ -1,0 +1,124 @@
+// Gemini thumbnail quality scoring.
+//
+// IMPORTANT: Gemini's generateContent API only accepts images as
+// inlineData (base64 bytes + mimeType) or fileData (a URI from Google's
+// own Files API). It does NOT accept a plain image URL. Every image has
+// to be downloaded here and re-encoded as base64 before it's sent.
+//
+// Model is read from GEMINI_MODEL (default gemini-2.5-flash) so a future
+// Google deprecation only needs an env var change, not a code change.
+// Do not hardcode a 2.0-series model -- that generation was discontinued
+// June 1, 2026.
+
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+function apiKey() {
+  return process.env.GEMINI_API_KEY || null;
+}
+
+async function fetchImageAsBase64(url, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`image fetch ${res.status}`);
+    const mimeType = res.headers.get("content-type") || "image/jpeg";
+    const buf = Buffer.from(await res.arrayBuffer());
+    return { mimeType, data: buf.toString("base64") };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function heuristicScore(reason) {
+  return {
+    score: 5,
+    notes: `AI scoring skipped (${reason}). Re-score this lead once available.`,
+    aiScored: false,
+  };
+}
+
+async function scoreThumbnails(thumbnailUrls, channelName) {
+  const key = apiKey();
+  if (!key) return heuristicScore("no GEMINI_API_KEY set");
+  if (!thumbnailUrls || thumbnailUrls.length === 0) {
+    return heuristicScore("no thumbnails available");
+  }
+
+  const urls = thumbnailUrls.slice(0, 5);
+  const imageParts = [];
+  for (const url of urls) {
+    try {
+      const img = await fetchImageAsBase64(url);
+      imageParts.push({ inlineData: { mimeType: img.mimeType, data: img.data } });
+    } catch {
+      // skip thumbnails that fail to download, don't kill the whole request
+    }
+  }
+
+  if (imageParts.length === 0) {
+    return heuristicScore("all thumbnail downloads failed");
+  }
+
+  const prompt = `You are a thumbnail quality analyst for a YouTube thumbnail design agency.
+Analyze these ${imageParts.length} thumbnail(s) from the channel "${channelName}" and score
+their overall weakness on a scale of 1-10.
+
+Score 1 = extremely weak thumbnails (ideal client for a redesign).
+Score 10 = excellent thumbnails (no need for a redesign).
+
+Judge: text readability, color contrast, facial expression/emotion, visual
+clutter, branding consistency, and scroll-stopping power.
+
+Respond with ONLY valid JSON, no markdown fences, in exactly this shape:
+{"score": <integer 1-10>, "notes": "<2-3 specific weaknesses, under 150 chars>"}`;
+
+  const body = {
+    contents: [
+      {
+        parts: [{ text: prompt }, ...imageParts],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 200,
+    },
+  };
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.warn(`Gemini API error ${res.status}: ${errText.slice(0, 300)}`);
+      return heuristicScore(`Gemini returned ${res.status}`);
+    }
+
+    const data = await res.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.warn("Could not find JSON in Gemini response:", rawText.slice(0, 200));
+      return heuristicScore("could not parse AI response");
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    const score = Math.min(10, Math.max(1, Math.round(Number(parsed.score) || 5)));
+    return {
+      score,
+      notes: parsed.notes || "No specific notes returned.",
+      aiScored: true,
+    };
+  } catch (err) {
+    console.warn("Gemini thumbnail scoring failed:", err.message);
+    return heuristicScore("request failed");
+  }
+}
+
+module.exports = { scoreThumbnails, GEMINI_MODEL };
